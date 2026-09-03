@@ -1231,6 +1231,14 @@ int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
 }
 EXPORT_SYMBOL_GPL(nvme_submit_sync_cmd);
 
+static int nvme_submit_sync_cmd_retry(struct request_queue *q,
+				      struct nvme_command *cmd, void *buffer,
+				      unsigned int bufflen)
+{
+	return __nvme_submit_sync_cmd(q, cmd, NULL, buffer, bufflen,
+			NVME_QID_ANY, NVME_SUBMIT_RETRY);
+}
+
 u32 nvme_command_effects(struct nvme_ctrl *ctrl, struct nvme_ns *ns, u8 opcode)
 {
 	u32 effects = 0;
@@ -1503,8 +1511,8 @@ static int nvme_identify_ctrl(struct nvme_ctrl *dev, struct nvme_id_ctrl **id)
 	if (!*id)
 		return -ENOMEM;
 
-	error = nvme_submit_sync_cmd(dev->admin_q, &c, *id,
-			sizeof(struct nvme_id_ctrl));
+	error = nvme_submit_sync_cmd_retry(dev->admin_q, &c, *id,
+					   sizeof(struct nvme_id_ctrl));
 	if (error) {
 		kfree(*id);
 		*id = NULL;
@@ -1585,8 +1593,8 @@ static int nvme_identify_ns_descs(struct nvme_ctrl *ctrl,
 	if (!data)
 		return -ENOMEM;
 
-	status = nvme_submit_sync_cmd(ctrl->admin_q, &c, data,
-				      NVME_IDENTIFY_DATA_SIZE);
+	status = nvme_submit_sync_cmd_retry(ctrl->admin_q, &c, data,
+					    NVME_IDENTIFY_DATA_SIZE);
 	if (status) {
 		dev_warn(ctrl->device,
 			"Identify Descriptors failed (nsid=%u, status=0x%x)\n",
@@ -1637,7 +1645,7 @@ int nvme_identify_ns(struct nvme_ctrl *ctrl, unsigned nsid,
 	if (!*id)
 		return -ENOMEM;
 
-	error = nvme_submit_sync_cmd(ctrl->admin_q, &c, *id, sizeof(**id));
+	error = nvme_submit_sync_cmd_retry(ctrl->admin_q, &c, *id, sizeof(**id));
 	if (error) {
 		dev_warn(ctrl->device, "Identify namespace failed (%d)\n", error);
 		kfree(*id);
@@ -1701,7 +1709,7 @@ static int nvme_ns_info_from_id_cs_indep(struct nvme_ctrl *ctrl,
 	if (!id)
 		return -ENOMEM;
 
-	ret = nvme_submit_sync_cmd(ctrl->admin_q, &c, id, sizeof(*id));
+	ret = nvme_submit_sync_cmd_retry(ctrl->admin_q, &c, id, sizeof(*id));
 	if (!ret) {
 		info->anagrpid = id->anagrpid;
 		info->is_shared = id->nmic & NVME_NS_NMIC_SHARED;
@@ -1942,7 +1950,7 @@ static int nvme_identify_ns_nvm(struct nvme_ctrl *ctrl, unsigned int nsid,
 	if (!nvm)
 		return -ENOMEM;
 
-	ret = nvme_submit_sync_cmd(ctrl->admin_q, &c, nvm, sizeof(*nvm));
+	ret = nvme_submit_sync_cmd_retry(ctrl->admin_q, &c, nvm, sizeof(*nvm));
 	if (ret)
 		kfree(nvm);
 	else
@@ -3482,7 +3490,7 @@ static int nvme_init_non_mdts_limits(struct nvme_ctrl *ctrl)
 	c.identify.cns = NVME_ID_CNS_CS_CTRL;
 	c.identify.csi = NVME_CSI_NVM;
 
-	ret = nvme_submit_sync_cmd(ctrl->admin_q, &c, id, sizeof(*id));
+	ret = nvme_submit_sync_cmd_retry(ctrl->admin_q, &c, id, sizeof(*id));
 	if (ret)
 		goto free_data;
 
@@ -4543,8 +4551,8 @@ static int nvme_scan_ns_list(struct nvme_ctrl *ctrl)
 			.identify.nsid		= cpu_to_le32(prev),
 		};
 
-		ret = nvme_submit_sync_cmd(ctrl->admin_q, &cmd, ns_list,
-					    NVME_IDENTIFY_DATA_SIZE);
+		ret = nvme_submit_sync_cmd_retry(ctrl->admin_q, &cmd, ns_list,
+						 NVME_IDENTIFY_DATA_SIZE);
 		if (ret) {
 			dev_warn(ctrl->device,
 				"Identify NS List failed (status=0x%x)\n", ret);
