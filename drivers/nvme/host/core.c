@@ -4543,8 +4543,9 @@ static int nvme_scan_ns_list(struct nvme_ctrl *ctrl)
 			.identify.nsid		= cpu_to_le32(prev),
 		};
 
-		ret = nvme_submit_sync_cmd(ctrl->admin_q, &cmd, ns_list,
-					    NVME_IDENTIFY_DATA_SIZE);
+		ret = __nvme_submit_sync_cmd(ctrl->admin_q, &cmd, NULL, ns_list,
+					     NVME_IDENTIFY_DATA_SIZE, NVME_QID_ANY,
+					     NVME_SUBMIT_RETRY);
 		if (ret) {
 			dev_warn(ctrl->device,
 				"Identify NS List failed (status=0x%x)\n", ret);
