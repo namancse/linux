@@ -5121,7 +5121,8 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
 		nr_hw_queues = nr_cpu_ids;
 	if (nr_hw_queues < 1)
 		return;
-	if (set->nr_maps == 1 && nr_hw_queues == set->nr_hw_queues)
+	if (set->nr_maps == 1 && nr_hw_queues == set->nr_hw_queues &&
+	    !set->ops->map_queues)
 		return;
 
 	memflags = memalloc_noio_save();
