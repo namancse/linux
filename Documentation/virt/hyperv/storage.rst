@@ -698,6 +698,92 @@ After registering the SCSI host, the SCSI mid-layer scans the targets and
 LUNs reported by Hyper-V.  The SCSI disk upper-level driver, ``sd``, binds to
 disk-type LUNs and registers the corresponding ``/dev/sdX`` block devices.
 
+The layer directly above storvsc
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The immediate caller of ``storvsc`` is the Linux SCSI mid-layer, principally
+the dispatch code in ``drivers/scsi/scsi_lib.c``.  For a disk, the ``sd``
+upper-level driver also participates by translating block operations into SCSI
+CDBs.  The responsibilities are divided as follows:
+
+.. code-block:: text
+
+  block layer
+     struct request: sector range, operation, bios
+          |
+          v
+  SCSI mid-layer                 drivers/scsi/scsi_lib.c
+     queue admission, command lifetime, retry and error handling
+          |
+          +--> sd             drivers/scsi/sd.c
+          |    build READ, WRITE, FLUSH, DISCARD, and other CDBs
+          |
+          v
+  SCSI low-level driver
+     storvsc: encode the prepared SCSI command for Hyper-V
+
+The object hierarchy follows the same split.  One ``Scsi_Host`` represents
+the synthetic controller registered by ``storvsc``.  It contains targets and
+one ``scsi_device`` for each discovered LUN.  The ``sd`` driver binds to a
+disk-type ``scsi_device`` and provides its block disk and request queue.
+``Scsi_Host.hostt`` points to the ``scsi_host_template`` supplied by
+``storvsc``; that template's ``queuecommand`` method is the final dispatch
+boundary from the SCSI mid-layer into the low-level driver.
+
+For SCSI blk-mq, the driver-private payload of each ``struct request`` begins
+with a ``struct scsi_cmnd``.  ``blk_mq_rq_to_pdu()`` obtains that command from
+the request, while ``scsi_cmd_to_rq()`` performs the reverse conversion.
+Storage reserved through ``scsi_host_template.cmd_size`` follows the
+``scsi_cmnd``; ``scsi_cmd_priv()`` returns that area, which is a
+``storvsc_cmd_request`` for this host.
+
+``scsi_queue_rq()`` is the SCSI request queue's blk-mq dispatch callback.  For
+an ordinary command it:
+
+1. checks the ``scsi_device``, target, and host queue state and accounts the
+  command against their queue limits;
+2. initializes the ``scsi_cmnd`` and the low-level driver's private area;
+3. calls ``scsi_prepare_cmd()``, which invokes the bound upper-level driver's
+  command initializer;
+4. marks the blk-mq request started; and
+5. calls ``scsi_dispatch_cmd()``.
+
+For a disk, the upper-level initializer is ``sd_init_command()``.  It switches
+on the block request operation.  A read or write enters
+``sd_setup_read_write_cmnd()``, which allocates the SCSI scatter-gather tables,
+checks device state, capacity, and logical-block alignment, converts the sector
+range to a logical block address and block count, and selects an appropriate
+READ or WRITE CDB format.  It also records transfer length, underflow, and
+retry information in the ``scsi_cmnd``.
+
+``scsi_dispatch_cmd()`` verifies that the device and host still exist, checks
+that the CDB fits the host's ``max_cmd_len``, and finally calls::
+
+  host->hostt->queuecommand(host, cmd)
+
+For this host, that expression calls ``storvsc_queuecommand()``.  A zero return
+means the low-level driver accepted the command and will eventually call
+``scsi_done()``.  A queue-busy return means it did not accept the command;
+``scsi_queue_rq()`` unwinds its busy accounting, returns a resource shortage to
+blk-mq, and the request is dispatched again later.  This contract is why a
+full VMBus ring can apply backpressure without completing or losing the SCSI
+command.
+
+Completion crosses the same boundary in reverse.  Storvsc records the VSP,
+SRB, and target status in ``scsi_cmnd.result`` and calls ``scsi_done()``.
+That function asks blk-mq to complete the request, whose SCSI ``.complete``
+callback is ``scsi_complete()``.  ``scsi_decide_disposition()`` then classifies
+the command result.  Depending on that disposition, the mid-layer:
+
+* calls ``scsi_finish_command()`` for normal completion;
+* reinserts the command for a retry;
+* requeues it after a temporary device-busy condition; or
+* gives it to the SCSI error handler for recovery.
+
+Thus storvsc reports what happened at the Hyper-V transport and SCSI target,
+but the SCSI mid-layer decides the generic recovery policy.  On successful
+completion, the ``sd`` completion path accounts the transferred bytes and the
+request ultimately returns through blk-mq to its bios.
+
 Request submission
 ~~~~~~~~~~~~~~~~~~
 The SCSI request queue installs ``scsi_queue_rq()`` as its ``blk-mq``
