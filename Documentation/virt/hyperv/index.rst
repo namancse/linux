@@ -9,6 +9,7 @@ Hyper-V Enlightenments
 
    overview
    vmbus
+   storage
    clocks
    vpci
    hibernation
