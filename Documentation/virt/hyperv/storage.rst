@@ -698,13 +698,13 @@ After registering the SCSI host, the SCSI mid-layer scans the targets and
 LUNs reported by Hyper-V.  The SCSI disk upper-level driver, ``sd``, binds to
 disk-type LUNs and registers the corresponding ``/dev/sdX`` block devices.
 
-The generic block layer above SCSI
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The generic block layer above SCSI and NVMe
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The generic block layer is the first common storage layer below filesystems,
 direct I/O, swap, and other block-device users.  It expresses I/O in terms of
 byte counts, 512-byte sectors, memory segments, and operations such as read,
 write, flush, and discard.  It does not understand SCSI CDBs or Hyper-V
-packets.
+packets, and the same machinery feeds both SCSI and NVMe block devices.
 
 A buffered file read does not necessarily reach this layer: a page-cache hit
 needs no device I/O.  On a cache miss, the filesystem maps file offsets to
@@ -712,7 +712,7 @@ device sectors and submits one or more ``bio`` objects.  Direct I/O and swap
 also construct bios, while stacked block drivers such as device mapper may
 remap, split, and resubmit them before they reach the SCSI disk queue.
 
-The principal objects at the SCSI boundary are:
+The principal objects at the block-driver boundary are:
 
 ``struct bio``
   Describes one block operation over a sector range and a vector of memory
@@ -1323,6 +1323,74 @@ complete all work already visible to the VSP.
 NVMe through virtual PCI
 ------------------------
 
+Where NVMe enters the stack
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The generic block and blk-mq discussion above is not SCSI-specific.  Both an
+``/dev/sdX`` disk and an ``/dev/nvmeXnY`` namespace receive bios, merge or
+split them into requests, use software and hardware blk-mq contexts, allocate
+tags, track timeouts, and eventually complete bios.  The paths split at each
+disk's ``request_queue.mq_ops``:
+
+.. code-block:: text
+
+  filesystem, direct I/O, swap, or another bio submitter
+                              |
+                              v
+                  bio -> generic block layer
+                              |
+                              v
+                       struct request
+                              |
+                +-------------+-------------+
+                |                           |
+      SCSI disk request queue      NVMe namespace request queue
+                |                           |
+                v                           v
+        scsi_queue_rq()               nvme_queue_rq()
+                |                           |
+       sd builds SCSI CDB          NVMe core builds command
+                |                           |
+     storvsc builds SRB/PFNs       nvme-pci builds PRPs/SGLs
+                |                           |
+       VMBus storage rings          PCI submission queue
+                |                           |
+       Hyper-V storage VSP         MMIO doorbell + controller
+
+Everything above the fork is shared generic block code.  Everything in the
+left branch from ``scsi_queue_rq()`` through ``sd``, ``scsi_cmnd``, SCSI error
+handling, and ``storvsc`` is specific to SCSI devices.  The right branch uses
+the NVMe core and an NVMe transport and does not instantiate those SCSI
+objects.
+
+The queues are created by different registration paths.  SCSI creates a
+``scsi_device.request_queue`` from ``Scsi_Host.tag_set`` and that tag set
+installs the SCSI blk-mq operations.  NVMe/PCI allocates admin and I/O tag sets
+whose operations are ``nvme_mq_admin_ops`` and ``nvme_mq_ops``.  When the NVMe
+core discovers a namespace, ``nvme_alloc_ns()`` calls ``blk_mq_alloc_disk()``
+with the controller's I/O tag set.  The resulting namespace queue therefore
+dispatches directly to the NVMe callbacks.
+
+Their per-request memory also differs:
+
+.. code-block:: text
+
+  SCSI/storvsc request                 NVMe/PCI request
+  +-------------------------+          +-------------------------+
+  | struct request          |          | struct request          |
+  +-------------------------+          +-------------------------+
+  | struct scsi_cmnd        |          | struct nvme_iod         |
+  +-------------------------+          |   struct nvme_request   |
+  | storvsc_cmd_request     |          |   struct nvme_command   |
+  +-------------------------+          |   DMA descriptor state  |
+  | inline SCSI SG storage  |          +-------------------------+
+  +-------------------------+
+
+Both use ``blk_mq_rq_to_pdu()`` to reach request-private storage.  The SCSI
+tag set sizes that storage for ``scsi_cmnd``, low-level-driver private data,
+and scatterlist entries.  The NVMe/PCI tag set uses
+``sizeof(struct nvme_iod)``; its first member is the common
+``nvme_request``, followed by the native command and PCI DMA-mapping state.
+
 Device discovery
 ~~~~~~~~~~~~~~~~
 Hyper-V initially presents a passed-through PCI device as a VMBus device with
@@ -1342,6 +1410,13 @@ The vPCI VMBus channel is used for presentation, configuration support,
 hotplug, and interrupt mapping.  It does not carry ordinary NVMe read and
 write commands.  Once configured, the controller uses the same NVMe queue
 interface that it would use on bare metal.
+
+This is a different use of Hyper-V from storvsc.  Storvsc's VMBus channel is
+the storage I/O transport, so every normal command crosses its shared rings.
+For NVMe, the vPCI channel is the device-presentation and management path.
+Ordinary I/O is expressed as native NVMe commands in DMA-backed queues; the
+PCI driver rings an MMIO doorbell in the mapped controller BAR, and Hyper-V
+routes the controller interrupt configured through vPCI.
 
 Request submission
 ~~~~~~~~~~~~~~~~~~
@@ -1363,7 +1438,12 @@ The NVMe PCI request queue installs ``nvme_queue_rq()`` as its ``blk-mq``
 ``nvme_setup_rw()`` translates the request into a 64-byte
 ``struct nvme_command``.  It fills the opcode, namespace ID, starting logical
 block address, block count, control flags, and command ID.  The command ID is
-derived from the ``blk-mq`` request tag.
+formed from the ``blk-mq`` request tag and a generation counter.  Unlike
+storvsc's unique tag, an NVMe command ID does not encode the blk-mq hardware
+context number because the completion already arrives on a particular NVMe
+queue.  ``nvme_handle_cqe()`` chooses that queue's tag table and uses the
+command ID to recover the request; the generation bits reject a stale
+completion after a tag has been reused.
 
 ``nvme_map_data()`` maps the request's data segments with the DMA API and
 describes them using NVMe Physical Region Page (PRP) entries or Scatter
