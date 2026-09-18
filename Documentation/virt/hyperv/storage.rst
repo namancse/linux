@@ -1530,6 +1530,284 @@ control mechanism for NVMe reads and writes.
      - ``storvsc_on_channel_callback()`` consumes VMBus packets.
      - ``nvme_irq()`` and ``nvme_handle_cqe()`` consume NVMe CQ entries.
 
+End-to-end NVMe PCI path
+~~~~~~~~~~~~~~~~~~~~~~~~
+The complete path can be divided into device presentation, controller
+bootstrap, I/O queue creation, namespace registration, request submission,
+and completion.
+
+Phase 1: expose a PCI function
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+The Hyper-V host first offers an ``HV_PCIE_GUID`` VMBus device.  This device
+represents a virtual PCI bus, not the NVMe namespace itself.  ``hv_pci_probe()``
+opens the VMBus channel, negotiates the vPCI protocol, obtains bus relations
+and resource requirements, enters the bus into D0, reports the selected
+resources, and creates a Linux PCI host bridge.
+
+``pci_scan_root_bus_bridge()`` enumerates the child functions described by the
+host.  When a child has PCI class ``PCI_CLASS_STORAGE_EXPRESS``, the normal PCI
+core matches it with the ``nvme`` PCI driver and calls ``nvme_probe()``.  From
+this point the NVMe driver operates on an ordinary ``struct pci_dev``.  It does
+not call ``hv_pci`` for each command.
+
+The important object relationship is::
+
+  VMBus hv_device with HV_PCIE_GUID
+   -> hv_pcibus_device
+     -> Linux PCI host bridge
+       -> pci_dev for the NVMe function
+         -> nvme_dev
+           -> nvme_ctrl
+
+The vPCI objects continue to own PCI configuration, resource, hotplug, and
+interrupt-routing state.  The ``nvme_dev`` owns the NVMe controller-specific
+queues, BAR mapping, DMA pools, and reset work.
+
+Phase 2: map the controller and bootstrap queue 0
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+``nvme_probe()`` maps BAR 0 and enables PCI memory access and bus mastering.
+``nvme_pci_enable()`` reads the NVMe ``CAP`` register to learn properties such
+as maximum queue depth and doorbell stride.  The fixed controller registers
+are near the beginning of the BAR; queue doorbells begin at
+``NVME_REG_DBS``.
+
+NVMe cannot use an admin command to create its first queue, because no command
+queue exists yet.  Queue ID 0 is therefore bootstrapped through controller
+registers:
+
+1. ``nvme_alloc_queue()`` allocates a completion queue and submission queue.
+  They are normally DMA-coherent guest memory.  It initializes the software
+  queue indices, phase bit, locks, DMA addresses, and doorbell pointer.
+2. ``nvme_pci_configure_admin_queue()`` disables the controller and writes the
+  admin queue attributes and DMA bases to ``AQA``, ``ASQ``, and ``ACQ``.
+3. ``nvme_enable_ctrl()`` sets ``CC.EN`` and waits for ``CSTS.RDY``.
+4. The driver requests an interrupt for queue 0 and marks the queue enabled.
+5. ``nvme_alloc_admin_tag_set()`` creates a one-hardware-queue blk-mq tag set
+  using ``nvme_mq_admin_ops`` and a ``struct nvme_iod`` payload per request.
+
+On Hyper-V, requesting the MSI or MSI-X interrupt invokes the vPCI interrupt
+domain.  ``hv_compose_msi_msg()`` sends a
+``PCI_CREATE_INTERRUPT_MESSAGE*`` request over the vPCI VMBus channel and the
+host returns the MSI address and data.  This VMBus exchange configures how a
+later controller interrupt reaches the guest; the later interrupt itself is
+not an NVMe completion packet on that channel.
+
+The admin queue carries commands about the controller rather than normal
+namespace traffic.  During initialization, ``nvme_init_ctrl_finish()`` uses it
+to identify the controller and learn capabilities and limits.  Admin commands
+are also used to negotiate the number of I/O queues, create and delete queue
+pairs, identify namespaces, request asynchronous events, and abort timed-out
+commands.
+
+Phase 3: create native I/O queue pairs
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+``nvme_setup_io_queues()`` asks the controller how many I/O queues it can
+support and reconciles that with CPUs, requested read/write/poll queues,
+available vectors, BAR space, and driver limits.  For each queue ID greater
+than zero:
+
+1. ``nvme_alloc_queue()`` allocates the DMA-backed SQ and CQ memory.
+2. ``adapter_alloc_cq()`` submits an NVMe Create I/O Completion Queue admin
+  command, specifying the CQ DMA address, depth, and interrupt vector.
+3. ``adapter_alloc_sq()`` submits Create I/O Submission Queue, specifying the
+  SQ DMA address and associated completion queue.
+4. ``queue_request_irq()`` installs ``nvme_irq()`` for an interrupt-driven
+  queue.  A polled queue deliberately has no interrupt.
+5. The queue is marked enabled and becomes available to blk-mq.
+
+After queue creation, ``nvme_alloc_io_tag_set()`` installs ``nvme_mq_ops``.
+Its hardware-queue count is the controller's number of I/O queues and its
+request payload size is ``sizeof(struct nvme_iod)``.  The PCI driver's
+``nvme_pci_map_queues()`` maps CPUs onto default, read, and optional poll
+queues, using interrupt affinity where an interrupt exists.
+
+The correspondence is direct for this transport::
+
+  blk-mq I/O hctx 0 -> NVMe queue ID 1
+  blk-mq I/O hctx 1 -> NVMe queue ID 2
+  ...
+
+Queue ID 0 is omitted because it belongs to the separate admin tag set.
+Multiple blk-mq hardware contexts therefore drive independent native queue
+pairs, reducing shared locks and allowing submissions and completions to stay
+near the CPUs assigned to their interrupts.
+
+Phase 4: discover namespaces and create block disks
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Once the controller reaches ``NVME_CTRL_LIVE``, ``nvme_start_ctrl()`` schedules
+namespace scanning.  Identify commands on the admin queue return namespace
+IDs and properties such as capacity, logical block formats, metadata, and
+feature support.
+
+For each usable namespace, ``nvme_alloc_ns()`` allocates ``struct nvme_ns`` and
+calls ``blk_mq_alloc_disk(ctrl->tagset, ...)``.  The resulting ``gendisk`` is
+published as a device such as ``/dev/nvme0n1``.  Its request queue uses the
+controller's I/O tag set, and its ``queuedata`` points to the namespace.  This
+is what lets ``nvme_setup_cmd()`` recover the namespace ID and LBA format from
+a generic block request.
+
+One namespace is not one hardware queue.  All namespaces attached to a
+controller normally share its I/O tag set and native queue pairs, while each
+namespace has its own block disk, capacity, and request queue.
+
+Phase 5: turn a block READ into an NVMe command
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+The generic block layer has already merged or split bios and selected an
+``hctx`` before calling ``nvme_queue_rq()``.  The request identifies the
+namespace through ``req->q->queuedata`` and the native queue through
+``hctx->driver_data``.  Its private ``struct nvme_iod`` contains the common
+NVMe request state, one ``struct nvme_command``, and PCI DMA descriptor state.
+
+The submission path is:
+
+.. code-block:: text
+
+  blk-mq struct request
+   -> nvme_queue_rq(hctx, request)
+     -> nvme_prep_rq()
+       -> nvme_setup_cmd(namespace, request)
+         -> nvme_setup_rw(..., nvme_cmd_read)
+       -> nvme_map_data()
+     -> nvme_sq_copy_cmd()
+     -> nvme_write_sq_db()
+
+For a READ, ``nvme_setup_rw()`` fills the native 64-byte command with:
+
+* the NVMe read opcode;
+* the namespace identifier;
+* starting logical block address;
+* zero-based number of logical blocks;
+* control, protection-information, and data-set-management fields; and
+* a command ID derived from the blk-mq request tag.
+
+Unlike the SCSI path, there is no intermediate CDB, SRB, or protocol conversion
+by a host storage service.  The command placed in memory is the command format
+defined by the NVMe specification.
+
+Phase 6: describe the data with PRPs or SGLs
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+The command must also tell the controller where to DMA the read data.
+``nvme_map_data()`` walks the block request's memory segments through the DMA
+API.  The resulting DMA addresses are valid in the PCI device's DMA domain;
+an IOMMU may translate them, so they are not generally interchangeable with
+CPU physical addresses.
+
+The PCI transport chooses one of two NVMe-native descriptions:
+
+``PRP``
+  ``PRP1`` names the first data page and may include an offset.  ``PRP2`` names
+  either the second page or a DMA-coherent PRP list containing further page
+  addresses.  Larger transfers may require chained PRP-list pages allocated
+  from the driver's DMA pools.
+
+``SGL``
+  An NVMe scatter-gather descriptor can describe an address and length or
+  point to a list of further descriptors.  The driver uses SGLs when the
+  controller supports them and request layout or command type makes them
+  suitable or necessary.
+
+The selected pointer is written into the command's data-pointer fields.  The
+``nvme_iod`` remembers allocated descriptor pages and DMA mappings so the
+completion or failed-submission path can release exactly those resources.
+
+Phase 7: publish the submission queue entry
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Each ``nvme_queue`` maintains a circular submission queue in memory and a
+software tail index.  Under ``nvmeq->sq_lock``, ``nvme_sq_copy_cmd()`` copies
+the prepared command into the current SQ slot and advances the tail.
+``nvme_write_sq_db()`` then publishes the new tail to the queue's submission
+doorbell.
+
+The doorbell is an MMIO register in BAR 0, not the submission queue itself.
+It tells the controller that commands through the new tail are available in
+DMA memory.  Required memory ordering ensures the SQ entry is visible before
+the doorbell.  If the controller supports the optional doorbell buffer, the
+driver can update a DMA-coherent shadow doorbell and avoid an MMIO write when
+the controller's event-index rules permit.
+
+The controller then:
+
+1. observes the new SQ tail;
+2. fetches the command from guest memory;
+3. follows its PRP or SGL descriptors;
+4. performs the namespace operation; and
+5. DMA-writes a completion queue entry.
+
+For a READ, the controller writes payload data into the mapped request pages.
+The CPU does not copy that payload through a VMBus ring or through the BAR.
+
+Phase 8: consume the completion queue entry
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+An interrupt-driven queue causes the controller to issue MSI-X or MSI after
+writing one or more completion entries.  Hyper-V routes the interrupt using
+the mapping established by vPCI.  ``nvme_irq()`` checks the completion queue
+and ``nvme_handle_cqe()`` processes each entry whose phase bit indicates that
+it is new.
+
+The completion entry contains its submission queue ID, command ID, status,
+result, and the controller's consumed SQ head.  The queue on which the entry
+arrived selects the corresponding blk-mq tag table.  ``nvme_find_rq()`` splits
+the command ID into a request tag and generation counter, finds the request,
+and rejects a stale generation.
+
+.. code-block:: text
+
+  MSI-X or MSI
+   -> nvme_irq()
+   -> nvme_poll_cq()
+   -> nvme_handle_cqe()
+     -> queue-local command ID lookup
+     -> nvme_pci_complete_rq()
+       -> unmap DMA and free PRP/SGL resources
+       -> nvme_complete_rq()
+         -> finish, retry, fail over, or authenticate
+         -> nvme_end_req()
+           -> blk_mq_end_request()
+           -> bio_endio()
+
+After consuming entries, the driver advances the CQ head and rings the
+completion doorbell so the controller knows which slots may be reused.  The
+phase bit toggles each time the circular queue wraps, distinguishing a new
+entry from an old entry still present in memory.
+
+NVMe completion policy is in the NVMe core, not the SCSI error handler.
+``nvme_decide_disposition()`` can finish the request, retry it, fail it over to
+another path when native NVMe multipathing applies, or initiate authentication
+handling for a fabrics controller.  A final outcome is converted to a block
+status and returned through blk-mq to every bio in the request.
+
+Polled I/O
+^^^^^^^^^^
+A poll queue follows the same command, DMA, SQ, and CQ formats but does not
+request an interrupt.  The blk-mq ``poll`` callback invokes ``nvme_poll()`` to
+inspect the completion queue from the submitting context.  This can avoid
+interrupt latency for applications using polled I/O, at the cost of CPU time.
+It is an alternative completion-notification method, not a different storage
+protocol.
+
+Timeout and controller reset
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Blk-mq calls ``nvme_timeout()`` when a request remains outstanding past its
+deadline.  The PCI driver first checks controller state and may poll the CQ in
+case the completion was written but its interrupt was lost.  Depending on the
+request and controller state, it can issue an Abort admin command, extend the
+timer, or schedule controller reset.
+
+``nvme_reset_work()`` quiesces I/O, disables the old controller instance,
+re-enables PCI and the controller, recreates queue 0, identifies the
+controller again, recreates I/O queues, updates the blk-mq hardware-queue
+count, and returns the controller to ``NVME_CTRL_LIVE``.  Queue ID 0 therefore
+has a stable administrative **role**, but its memory and interrupt can be torn
+down and recreated during reset.  Outstanding requests are synchronized with
+this lifecycle by queue quiescing, controller state transitions, and blk-mq
+tag iteration.
+
+The reset boundary is also where vPCI may be involved again: PCI enablement,
+BAR access, function-level reset, and interrupt allocation use the PCI
+environment supplied by ``hv_pci``.  Nevertheless, successful namespace I/O
+after reset resumes on native NVMe SQ/CQ pairs rather than a VMBus storage
+channel.
+
 Request submission
 ~~~~~~~~~~~~~~~~~~
 The NVMe PCI request queue installs ``nvme_queue_rq()`` as its ``blk-mq``
