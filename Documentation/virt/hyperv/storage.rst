@@ -797,6 +797,106 @@ In short, queue registration selects the call path, and request-private memory
 supplies the per-I/O storvsc state.  The generic ``struct request`` itself does
 not need to know about Hyper-V or storvsc.
 
+What the SCSI blk-mq layer does
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+This layer adapts the block multi-queue model to the SCSI device, target, and
+host model.  Three objects have different scopes:
+
+``Scsi_Host.tag_set``
+  Describes resources shared by the synthetic SCSI controller.  It supplies
+  the SCSI blk-mq callbacks, hardware-queue count, tag depth, and command
+  payload size used when requests are allocated.
+
+``scsi_device.request_queue``
+  Is the block queue for one discovered LUN.  It is allocated from the host's
+  tag set.  Its ``queuedata`` points back to that ``scsi_device``, allowing a
+  dispatched request to find its LUN, target, and host.
+
+``struct request``
+  Represents one block operation after adjacent bios have been merged and
+  scheduled.  Its blk-mq tag identifies one occupied command slot.  The
+  request's private payload carries the corresponding ``scsi_cmnd`` and
+  storvsc state for as long as that slot is in use.
+
+Blk-mq maps submitting CPUs onto hardware dispatch contexts, or ``hctx``
+objects.  For storvsc, the SCSI core supplies the generic CPU mapping because
+the storvsc host template does not override ``map_queues``.  An ``hctx`` is
+not a VMBus channel: it is blk-mq's dispatch and tag-allocation context.
+``storvsc_queuecommand()`` separately passes the current CPU to
+``storvsc_do_io()``, which prefers that CPU's assigned VMBus channel but may
+use another channel when rings are busy.  Consequently the two queueing layers
+cooperate without requiring a permanent one-to-one mapping between an ``hctx``
+and a VMBus channel.
+
+The layer performs the following jobs for each normal request:
+
+* **Admission and fairness.**  ``scsi_queue_rq()`` checks whether the LUN,
+  target, and host can accept another command and accounts it against their
+  busy limits.  This is above storvsc because several LUN request queues may
+  share one target or host, while blk-mq otherwise sees separate block queues.
+* **Command initialization.**  It resets the reusable ``scsi_cmnd`` and the
+  storvsc-private area, associates the command with the ``scsi_device``, and
+  prepares scatter-gather storage and sense data.
+* **Protocol preparation.**  It invokes the upper-level SCSI driver.  For a
+  disk, ``sd_init_command()`` translates the block operation into a SCSI CDB
+  and sets transfer direction, expected length, retry allowance, and related
+  command fields.
+* **Low-level dispatch.**  It starts the blk-mq request and calls storvsc's
+  ``queuecommand`` method through the host template.  From this point storvsc
+  owns transport submission until it either refuses the command immediately
+  or later calls ``scsi_done()``.
+* **Backpressure.**  If storvsc cannot put the command on a VMBus ring, it
+  returns a SCSI queue-busy reason without accepting ownership.  The SCSI
+  layer releases its busy accounting and returns a resource status to blk-mq,
+  which dispatches the request again later.
+* **Completion policy.**  After an accepted command completes, SCSI interprets
+  the host, driver, and target status.  It can finish the request, retry it,
+  delay it for a temporary device-busy condition, or move it to the SCSI error
+  handler.  Storvsc supplies the result; the common SCSI layer supplies this
+  policy.
+
+For example, a disk READ follows this object and callback path:
+
+.. code-block:: text
+
+  bio(s)
+    -> struct request on scsi_device.request_queue
+    -> scsi_queue_rq()
+         queuedata                         -> scsi_device -> Scsi_Host
+         blk_mq_rq_to_pdu(request)         -> scsi_cmnd
+         scsi_cmd_priv(scsi_cmnd)          -> storvsc_cmd_request
+    -> sd_init_command()                   build READ CDB
+    -> scsi_dispatch_cmd()
+    -> storvsc_queuecommand()              map data and build vstor_packet
+    -> storvsc_do_io()                     submit on a VMBus channel
+    -> Hyper-V storage service
+
+  completion packet with request tag
+    -> scsi_host_find_tag()                recover scsi_cmnd
+    -> scsi_cmd_priv(scsi_cmnd)            recover storvsc_cmd_request
+    -> storvsc_on_io_completion()          record SCSI/transport result
+    -> scsi_done()
+    -> blk_mq_complete_request()
+    -> scsi_complete()                     finish, retry, requeue, or error-handle
+    -> complete request bios
+
+The blk-mq tag is particularly useful at the virtualization boundary.
+The request's ordinary ``tag`` is unique only within one hardware context, so
+``blk_mq_unique_tag()`` combines the hardware-context number in its upper bits
+with that local tag in its lower bits.  Storvsc adds one to this value for the
+VMBus transaction ID because transaction ID zero is reserved.  On completion
+it subtracts one and uses ``scsi_host_find_tag()`` to recover the live
+``scsi_cmnd``.  Thus the unique tag is simultaneously a blk-mq command-slot
+identity and storvsc's wire correlation key; no raw guest pointer must be
+echoed by the host for ordinary I/O.
+
+The separation also explains why storvsc does not implement a blk-mq
+``queue_rq`` callback directly.  Blk-mq provides generic CPU-to-queue dispatch,
+tag allocation, scheduling, timeout, and completion machinery.  The SCSI core
+adds shared host/target/LUN policy and SCSI error recovery.  Storvsc only has
+to implement the transport-specific boundary: encode an already prepared SCSI
+command for Hyper-V and report its result.
+
 ``scsi_queue_rq()`` is the SCSI request queue's blk-mq dispatch callback.  For
 an ordinary command it:
 
