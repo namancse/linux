@@ -736,6 +736,67 @@ Storage reserved through ``scsi_host_template.cmd_size`` follows the
 ``scsi_cmnd``; ``scsi_cmd_priv()`` returns that area, which is a
 ``storvsc_cmd_request`` for this host.
 
+How a blk-mq request is linked to storvsc
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+The link is established during controller and LUN registration, before any
+ordinary I/O is submitted.  Storvsc defines a ``scsi_host_template`` with::
+
+  .queuecommand = storvsc_queuecommand
+  .cmd_size = sizeof(struct storvsc_cmd_request)
+
+``storvsc_probe()`` passes that template to ``scsi_host_alloc()`` and later
+calls ``scsi_add_host()``.  Host registration reaches
+``scsi_mq_setup_tags()``, which creates the host's blk-mq tag set with:
+
+* ``queue_rq = scsi_queue_rq`` in the SCSI blk-mq operations;
+* ``driver_data = Scsi_Host``;
+* the hardware-queue count and queue depth selected for the host; and
+* a per-request payload large enough for ``scsi_cmnd``,
+  ``storvsc_cmd_request``, and the inline scatterlist.
+
+When scanning creates a ``scsi_device`` for a LUN, ``scsi_alloc_sdev()``
+creates that device's ``request_queue`` from the same host tag set and stores
+the ``scsi_device`` as the queue's ``queuedata``.  The resulting static pointer
+chain is::
+
+  request->q->queuedata = scsi_device
+  scsi_device->host = Scsi_Host
+  Scsi_Host->hostt = storvsc scsi_host_template
+  Scsi_Host->hostt->queuecommand = storvsc_queuecommand
+
+Blk-mq allocates driver command data immediately after each request.  For a
+storvsc-backed SCSI queue, the relevant memory layout is:
+
+.. code-block:: text
+
+  +------------------------+
+  | struct request         |
+  +------------------------+ <- blk_mq_rq_to_pdu(request)
+  | struct scsi_cmnd       |
+  +------------------------+ <- scsi_cmd_priv(scsi_cmnd)
+  | storvsc_cmd_request    |
+  +------------------------+
+  | inline SCSI SG storage |
+  +------------------------+
+
+At dispatch, ``scsi_queue_rq()`` obtains the embedded command with
+``blk_mq_rq_to_pdu(request)``.  After ``sd`` prepares its CDB,
+``scsi_dispatch_cmd()`` follows ``cmd->device->host->hostt->queuecommand`` and
+therefore enters ``storvsc_queuecommand()``.  Storvsc then obtains both kinds
+of state without allocating a separate normal command object::
+
+  host_dev = shost_priv(host)
+  cmd_request = scsi_cmd_priv(scmnd)
+
+``host_dev`` leads to the controller's ``hv_device``.  ``cmd_request`` holds
+this command's Hyper-V packet and PFN descriptor.  The original blk-mq request
+remains recoverable through ``scsi_cmd_to_rq(scmnd)``, which is how storvsc
+derives the unique transaction tag used to match the eventual completion.
+
+In short, queue registration selects the call path, and request-private memory
+supplies the per-I/O storvsc state.  The generic ``struct request`` itself does
+not need to know about Hyper-V or storvsc.
+
 ``scsi_queue_rq()`` is the SCSI request queue's blk-mq dispatch callback.  For
 an ordinary command it:
 
