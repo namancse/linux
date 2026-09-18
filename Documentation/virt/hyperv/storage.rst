@@ -1418,6 +1418,118 @@ Ordinary I/O is expressed as native NVMe commands in DMA-backed queues; the
 PCI driver rings an MMIO doorbell in the mapped controller BAR, and Hyper-V
 routes the controller interrupt configured through vPCI.
 
+How the two paths use VMBus differently
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+It is useful to separate the **control plane**, which discovers and configures
+a device, from the **data plane**, which submits ordinary reads and writes.
+Both paths use VMBus in their control plane, but only storvsc uses a VMBus
+channel as its storage data plane.
+
+For synthetic SCSI, VMBus is both planes:
+
+.. code-block:: text
+
+  control plane
+    VMBus offer with HV_SCSI_GUID
+      -> open primary channel
+      -> negotiate storage protocol
+      -> query controller properties
+      -> create storage subchannels
+      -> discover SCSI LUNs
+
+  data plane for every command
+    storvsc_queuecommand()
+      -> vstor_packet containing Hyper-V SRB and SCSI CDB
+      +  VMBus multipage-buffer descriptor containing guest PFNs
+      -> VMBus outbound ring
+      -> storage VSP
+
+    storage VSP completion
+      -> VMBus inbound ring
+      -> storvsc_on_channel_callback()
+      -> scsi_done()
+
+For NVMe through vPCI, VMBus establishes the PCI environment but is outside
+the normal NVMe command path:
+
+.. code-block:: text
+
+  vPCI control plane
+    VMBus offer with HV_PCIE_GUID
+      -> negotiate vPCI protocol
+      -> query bus relations
+      -> enter D0 and assign PCI resources
+      -> create interrupt mappings
+      -> report hot-add, eject, and invalidation events
+      -> expose a PCI function to the Linux PCI core
+
+  NVMe data plane for every command
+    nvme_queue_rq()
+      -> native NVMe command with PRP or SGL DMA addresses
+      -> DMA-backed NVMe submission queue
+      -> MMIO submission-queue doorbell
+      -> NVMe controller
+
+    controller writes NVMe completion queue
+      -> configured MSI-X or MSI interrupt
+      -> nvme_irq() / nvme_handle_cqe()
+      -> nvme_complete_rq()
+
+The ordinary NVMe submission path therefore contains no
+``vmbus_sendpacket()`` call.  ``hv_pci`` does use that API for vPCI protocol
+messages such as ``PCI_QUERY_PROTOCOL_VERSION``, ``PCI_QUERY_BUS_RELATIONS``,
+``PCI_BUS_D0ENTRY``, resource assignment, and interrupt creation.  Its channel
+callback receives replies plus asynchronous bus-relation, eject, and
+invalidation notifications.  Those operations arrange the device around the
+I/O queues; they do not carry NVMe submission or completion queue entries.
+
+The memory descriptors illustrate the same distinction.  Storvsc places a
+Hyper-V multipage-buffer descriptor beside the SRB in a VMBus packet.  The
+descriptor names the guest pages that the storage VSP accesses, so the bulk
+data is not copied through the ring.  NVMe places PCI DMA addresses in PRP or
+SGL fields of a native NVMe command already stored in its submission queue.
+The controller accesses those pages through its DMA domain; no VMBus storage
+packet or Hyper-V PFN array is constructed by ``nvme-pci``.
+
+Completion correlation is also independent:
+
+* Storvsc places the blk-mq unique tag in the VMBus transaction ID.  The VSP
+  echoes that ID in an inbound-ring completion packet.
+* NVMe places a queue-local request tag plus generation bits in the NVMe
+  command ID.  The controller returns it in a completion queue entry.
+* vPCI control requests use separate VMBus transaction IDs to wake the
+  ``hv_pci`` operation waiting for a protocol response.  Those IDs do not
+  identify NVMe block requests.
+
+This changes where pressure is observed.  A full storvsc outbound VMBus ring
+can reject an ordinary SCSI command and cause blk-mq to retry it; storvsc may
+also choose another storage subchannel.  An NVMe I/O is instead bounded by
+blk-mq tags, the NVMe submission queue depth, DMA resources, and controller
+state.  Congestion in the vPCI management channel is not the normal flow-
+control mechanism for NVMe reads and writes.
+
+.. list-table:: VMBus role in the two Hyper-V storage paths
+   :header-rows: 1
+
+   * - Question
+     - Synthetic SCSI with storvsc
+     - NVMe through vPCI
+   * - Why is the VMBus device offered?
+     - It is the synthetic storage controller.
+     - It is a virtual PCI bus that exposes a child NVMe function.
+   * - Does every normal I/O cross a VMBus ring?
+     - Yes; command and page descriptors go out and completion comes back.
+     - No; native NVMe queues, doorbells, DMA, and MSI carry normal I/O.
+   * - What does the VMBus channel protocol describe?
+     - Storage initialization, SCSI SRBs, PFNs, and storage completions.
+     - PCI discovery, power, resources, interrupts, hotplug, and teardown.
+   * - What identifies an ordinary block request?
+     - VMBus transaction ID derived from the blk-mq unique tag.
+     - NVMe command ID returned in an NVMe completion queue entry.
+   * - What callback consumes ordinary completions?
+     - ``storvsc_on_channel_callback()`` consumes VMBus packets.
+     - ``nvme_irq()`` and ``nvme_handle_cqe()`` consume NVMe CQ entries.
+
 Request submission
 ~~~~~~~~~~~~~~~~~~
 The NVMe PCI request queue installs ``nvme_queue_rq()`` as its ``blk-mq``
