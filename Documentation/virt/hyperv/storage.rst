@@ -698,6 +698,142 @@ After registering the SCSI host, the SCSI mid-layer scans the targets and
 LUNs reported by Hyper-V.  The SCSI disk upper-level driver, ``sd``, binds to
 disk-type LUNs and registers the corresponding ``/dev/sdX`` block devices.
 
+The generic block layer above SCSI
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The generic block layer is the first common storage layer below filesystems,
+direct I/O, swap, and other block-device users.  It expresses I/O in terms of
+byte counts, 512-byte sectors, memory segments, and operations such as read,
+write, flush, and discard.  It does not understand SCSI CDBs or Hyper-V
+packets.
+
+A buffered file read does not necessarily reach this layer: a page-cache hit
+needs no device I/O.  On a cache miss, the filesystem maps file offsets to
+device sectors and submits one or more ``bio`` objects.  Direct I/O and swap
+also construct bios, while stacked block drivers such as device mapper may
+remap, split, and resubmit them before they reach the SCSI disk queue.
+
+The principal objects at the SCSI boundary are:
+
+``struct bio``
+  Describes one block operation over a sector range and a vector of memory
+  segments.  It carries operation flags, the target block device, status, and
+  an end-I/O callback.  A bio is the unit passed between block-device layers
+  and eventually completed back to its submitter.
+
+``struct request``
+  Is blk-mq's scheduling and driver-dispatch unit.  It contains one or more
+  compatible bios, the combined sector and byte range, operation flags, queue
+  pointers, a timeout, and a tag.  SCSI receives a request, not an individual
+  filesystem bio.
+
+``struct request_queue``
+  Represents the queue and limits of one block disk.  The limits inherited
+  from the SCSI host and device tell the block layer how large an I/O may be,
+  how many segments it may contain, its alignment requirements, and which
+  operations are supported.
+
+``struct blk_mq_ctx``
+  Is a software submission context associated with a CPU.  Per-CPU contexts
+  avoid a single global submission lock when many CPUs issue I/O concurrently.
+
+``struct blk_mq_hw_ctx``
+  Is a hardware dispatch context.  The tag-set queue map assigns software
+  contexts to hardware contexts.  It owns dispatch state and the list of
+  requests that were ready but could not yet be accepted below.
+
+``struct blk_mq_tag_set``
+  Describes the driver's hardware queues, queue depth, callback operations,
+  and private payload size.  Tags identify occupied request slots and bound
+  the number of commands that can be in flight.
+
+Bio submission and request formation
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+For a non-stacking SCSI disk, the important submission path is::
+
+  submit_bio()
+    -> submit_bio_noacct()
+    -> __submit_bio()
+    -> blk_mq_submit_bio()
+
+Before a bio becomes a request, the block layer validates it against the
+queue's current limits.  It rejects unsupported or misaligned operations and
+uses ``__bio_split_to_limits()`` when an operation exceeds limits such as the
+maximum transfer size or segment count.
+
+``blk_mq_submit_bio()`` then tries to merge the bio with a compatible request.
+Merging adjacent bios can reduce dispatch and protocol overhead, but is only
+allowed when operation, range, limits, and request flags permit it.  If no
+merge is possible, blk-mq obtains a request from the queue's tag-set-backed
+request pool and ``blk_mq_bio_to_request()`` attaches the bio and initializes
+the request's range and operation.
+
+A task may have an active block plug.  In that case, new requests are held
+briefly in the plug so adjacent I/O produced by the same task can be merged
+before dispatch.  Without a plug, the request may still enter an I/O scheduler
+such as ``mq-deadline``, depending on queue configuration.  The scheduler can
+reorder requests for latency, fairness, or locality, but it does not alter the
+SCSI command because that command has not been prepared yet.
+
+Dispatch into SCSI
+^^^^^^^^^^^^^^^^^^
+When a request is selected for dispatch, blk-mq maps it to a
+``blk_mq_hw_ctx`` and obtains the resources needed to issue it.  A request can
+take a fast path directly from submission to dispatch, or arrive later from a
+plug, scheduler, or hardware-context dispatch list.  These paths converge at
+the queue's ``blk_mq_ops.queue_rq`` callback:
+
+.. code-block:: text
+
+  bio
+    -> validate and split to request_queue limits
+    -> merge with an existing request, or allocate a request
+    -> task plug, optional I/O scheduler, or direct issue
+    -> blk_mq_hw_ctx dispatch
+    -> request_queue.mq_ops->queue_rq()
+    -> scsi_queue_rq()
+
+The SCSI tag set installed ``scsi_queue_rq()`` as this callback.  This is the
+precise handoff from generic block semantics to SCSI semantics.  Only after
+the handoff does ``sd`` translate the request operation and sector range into
+a CDB, and only later does storvsc encode that command for VMBus.
+
+The callback return value is part of blk-mq flow control.  ``BLK_STS_OK``
+means the lower layer accepted the request.  ``BLK_STS_RESOURCE`` or
+``BLK_STS_DEV_RESOURCE`` means it did not; blk-mq retains the request on a
+dispatch list and runs the queue again when resources may be available.  A
+terminal error instead ends the request.  Therefore a request is neither lost
+nor treated as in flight merely because a dispatch attempt reached SCSI.
+
+Completion back to bios
+^^^^^^^^^^^^^^^^^^^^^^^
+On the return path, SCSI completes the request only after its retry and error
+policy has selected a final outcome.  The block layer then accounts the I/O,
+advances or completes every bio attached to the request, invokes each bio's
+end-I/O path, releases quality-of-service and scheduler state, and returns the
+request and tag to the reusable pool.  In simplified form::
+
+  scsi_finish_command()
+    -> SCSI I/O completion processing
+    -> blk_update_request() / blk_mq_end_request()
+    -> bio_endio()
+    -> filesystem, direct-I/O, swap, or other original completion
+
+Partial completion is possible: ``blk_update_request()`` can complete a byte
+range and leave the request positioned at its remaining bios and sectors.
+Normal storvsc disk I/O usually reports a final SCSI command result, after
+which the completed request slot can be reused for an unrelated operation.
+
+Blk-mq also owns generic request timeout tracking.  Its SCSI ``timeout``
+callback hands an expired request to SCSI timeout and error-handling policy;
+storvsc's low-level timeout callback participates below that boundary.  Queue
+freezing uses the queue usage reference to stop new submission and wait for
+users during device removal or reconfiguration.
+
+Thus the generic block layer decides **when and in what grouping** storage
+work is dispatched.  The SCSI layer decides **how the block operation is
+represented and recovered as a SCSI command**.  Storvsc decides **how that
+command is transported through Hyper-V**.
+
 The layer directly above storvsc
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The immediate caller of ``storvsc`` is the Linux SCSI mid-layer, principally
