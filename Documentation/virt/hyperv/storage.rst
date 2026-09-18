@@ -80,6 +80,140 @@ hardware or an NVMe-based storage service may still appear as a synthetic
 SCSI disk to the guest.  Such a disk follows the ``storvsc`` path.  Only a
 guest-visible NVMe PCI function follows the native NVMe path described below.
 
+Storage object and device-name terminology
+------------------------------------------
+The terms disk, LUN, namespace, and block device describe different layers.
+They often have a one-to-one relationship in a simple guest, but they are not
+interchangeable.
+
+.. list-table:: Storage object terminology
+   :header-rows: 1
+
+   * - Term
+     - Layer
+     - Meaning
+   * - Disk
+     - Context dependent
+     - A generic word for storage media, a host-provided virtual disk, or a
+       Linux whole-disk block object.  It is not a precise protocol address.
+   * - SCSI logical unit
+     - SCSI protocol
+     - An object selected by a Logical Unit Number (LUN) behind a SCSI target.
+       A logical unit has a SCSI peripheral type and need not be a disk.
+   * - NVMe namespace
+     - NVMe protocol
+     - A formatted logical block address space identified by a namespace ID
+       (NSID) and accessible through one or more NVMe controllers.
+   * - ``gendisk``
+     - Linux block layer
+     - The kernel registration for one whole block device, including its name,
+       capacity, request queue, operations, and partition table.
+   * - ``block_device``
+     - Linux block layer
+     - The kernel object for the whole device or one partition.  It records the
+       device number and, for a partition, its range within the whole device.
+   * - ``/dev/sda`` or ``/dev/nvme0n1``
+     - Userspace ABI
+     - A block-special device node whose major and minor number select a Linux
+       block device.  The pathname is a name for the device, not another
+       storage layer.
+   * - ``/dev/block/8:0``
+     - Userspace convention
+     - Usually a device-manager-created symlink to the friendly node having
+       major 8 and minor 0, such as ``/dev/sda``.
+   * - ``/sys/dev/block/8:0``
+     - Kernel sysfs ABI
+     - The kernel-created major:minor lookup link for that block device's
+       sysfs object.  It is not a device node used for I/O.
+
+The SCSI protocol address has the form ``host:channel:target:LUN`` in Linux.
+SCSI scanning creates a ``struct scsi_device`` for a discovered logical unit
+and records its LUN.  The ``sd`` upper-level driver binds only to supported
+disk-like peripheral types.  It then allocates a ``struct gendisk``, assigns
+an ``sd`` name such as ``sda``, assigns a major and minor range, and publishes
+the disk through the block layer.  Other SCSI peripheral types can use other
+upper-level drivers and do not become ``/dev/sdX`` disks.
+
+Consequently, a LUN and an ``sdX`` disk are commonly paired, but they are not
+the same identifier.  The name ``sda`` does not encode the SCSI LUN.  Probe
+order can also change ``sdX`` assignment across boots or hotplug events.
+
+NVMe discovers namespaces by NSID.  The NVMe core creates namespace objects
+and a ``struct gendisk`` for an accessible block namespace.  The resulting
+name is normally ``nvmeXnY``; native NVMe multipathing can also create hidden
+controller-path disks and one visible namespace-head disk.  These names use
+kernel-assigned controller, subsystem, and namespace instance numbers, so
+they should not be treated as persistent protocol identifiers.
+
+The two common mappings are therefore:
+
+.. code-block:: text
+
+   Hyper-V synthetic SCSI
+
+   host-provided virtual disk
+       -> SCSI target + LUN
+       -> struct scsi_device
+       -> sd driver
+       -> struct gendisk named sda
+       -> dev_t 8:0 in a typical first-disk assignment
+       -> /dev/sda
+       -> /dev/block/8:0, commonly a symlink to ../sda
+
+   Hyper-V vPCI NVMe
+
+   controller-accessible namespace with an NSID
+       -> struct nvme_ns and namespace head
+       -> struct gendisk named, for example, nvme0n1
+       -> a dynamically assigned dev_t
+       -> /dev/nvme0n1
+       -> /dev/block/<major>:<minor>, when userspace creates the link
+
+The host's physical backing does not alter this guest-visible mapping.  For
+example, host NVMe media exported through synthetic SCSI is still a SCSI LUN
+in the guest and normally appears as ``/dev/sdX``.
+
+Whole devices and partitions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A partition is not another SCSI LUN or NVMe namespace.  It is a sector range
+within an already published Linux whole-disk device.  The block layer creates
+a separate ``struct block_device`` and device number for each discovered
+partition:
+
+.. code-block:: text
+
+   SCSI LUN              /dev/sda       whole device
+                           /dev/sda1     partition 1 within sda
+
+   NVMe namespace        /dev/nvme0n1   whole device
+                           /dev/nvme0n1p1 partition 1 within nvme0n1
+
+Partition names add ``p`` when the whole-disk name already ends in a digit.
+This keeps ``nvme0n1p1`` unambiguous, while ``sda1`` needs no separator.  Both
+the whole device and each partition have their own major:minor identity and
+can have corresponding ``/dev/block/<major>:<minor>`` links.
+
+Device numbers and stable names
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A block-special node stores a ``dev_t`` composed of a major and minor number.
+Opening either ``/dev/sda`` or a symlink such as ``/dev/block/8:0`` ultimately
+selects the same registered block device when both resolve to major 8, minor
+0.  The data is not duplicated, and I/O does not traverse an extra
+``/dev/block`` layer.
+
+The kernel creates the named devtmpfs node from the registered device name and
+creates the canonical ``/sys/dev/block/<major>:<minor>`` lookup link.  A
+userspace device manager commonly creates ``/dev/block/<major>:<minor>`` and
+``/dev/disk/by-*`` symlinks.  Minimal systems without such a device manager
+need not contain the ``/dev/block`` links.
+
+Neither discovery-order names such as ``sda`` nor major:minor numbers should
+be assumed stable across reconfiguration.  Filesystems, mounts, and
+administrative configuration should normally use an appropriate persistent
+identifier, such as a filesystem UUID or a suitable ``/dev/disk/by-id`` link.
+The SCSI address, SCSI identifiers, NVMe NSID, NVMe UUID, and NGUID remain
+separate identities used at their respective layers.
+
 Storvsc driver deep dive
 ------------------------
 
