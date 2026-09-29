@@ -400,6 +400,10 @@ struct mshv_vtl_low_range {
 	struct rcu_head rcu;
 };
 
+/* Registered ranges whose pgmap folios are smaller than a PMD. */
+static LIST_HEAD(mshv_vtl_low_suborder_ranges);
+static DEFINE_SPINLOCK(mshv_vtl_low_suborder_lock);
+
 static bool mshv_vtl_low_range_registered(unsigned long start_pfn,
 					  unsigned long end_pfn)
 {
@@ -418,11 +422,31 @@ static bool mshv_vtl_low_range_registered(unsigned long start_pfn,
 	return found;
 }
 
+static bool mshv_vtl_low_span_suborder(unsigned long start_pfn,
+				       unsigned long end_pfn)
+{
+	struct mshv_vtl_low_range *range;
+	bool suborder = false;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(range, &mshv_vtl_low_suborder_ranges, list) {
+		if (start_pfn < range->end_pfn && end_pfn > range->start_pfn) {
+			suborder = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return suborder;
+}
+
 static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
 {
 	struct mshv_vtl_ram_disposition vtl0_mem;
 	struct mshv_vtl_low_range *range;
+	struct mshv_vtl_low_range *suborder = NULL;
 	struct dev_pagemap *pgmap;
+	unsigned long pfn;
 	void *addr;
 
 	if (copy_from_user(&vtl0_mem, arg, sizeof(vtl0_mem)))
@@ -475,9 +499,19 @@ static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
 		return -ENOMEM;
 	}
 
+	if (pgmap->vmemmap_shift < PMD_ORDER) {
+		suborder = kzalloc_obj(*suborder);
+		if (!suborder) {
+			kfree(range);
+			kfree(pgmap);
+			return -ENOMEM;
+		}
+	}
+
 	addr = devm_memremap_pages(mem_dev, pgmap);
 	if (IS_ERR(addr)) {
 		dev_err(vtl->module_dev, "devm_memremap_pages error: %ld\n", PTR_ERR(addr));
+		kfree(suborder);
 		if (mshv_vtl_low_range_registered(vtl0_mem.start_pfn,
 						  vtl0_mem.last_pfn)) {
 			kfree(range);
@@ -488,6 +522,20 @@ static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
 		kfree(range);
 		kfree(pgmap);
 		return PTR_ERR(addr);
+	}
+
+	/* Keep raw-PFN PMD mappings pinnable for the lifetime of the pgmap. */
+	for (pfn = vtl0_mem.start_pfn; pfn < vtl0_mem.last_pfn;
+	     pfn += 1UL << pgmap->vmemmap_shift)
+		folio_get(pfn_folio(pfn));
+
+	/* Publish the order constraint before making the pgmap range visible. */
+	if (suborder) {
+		suborder->start_pfn = vtl0_mem.start_pfn;
+		suborder->end_pfn = vtl0_mem.last_pfn;
+		spin_lock(&mshv_vtl_low_suborder_lock);
+		list_add_rcu(&suborder->list, &mshv_vtl_low_suborder_ranges);
+		spin_unlock(&mshv_vtl_low_suborder_lock);
 	}
 
 	/* Publish only after the vmemmap and struct pages are initialized. */
@@ -1371,9 +1419,9 @@ static void mshv_vtl_low_set_mapping(struct vm_fault *vmf, struct folio *folio)
 static vm_fault_t mshv_vtl_low_huge_fault(struct vm_fault *vmf, unsigned int order)
 {
 	unsigned long pfn = vmf->pgoff;
+	unsigned long pmd_pfns = PMD_SIZE >> PAGE_SHIFT;
 	bool write = vmf->flags & FAULT_FLAG_WRITE;
 	struct page *page;
-	vm_fault_t ret = VM_FAULT_FALLBACK;
 
 	switch (order) {
 	case 0:
@@ -1385,14 +1433,14 @@ static vm_fault_t mshv_vtl_low_huge_fault(struct vm_fault *vmf, unsigned int ord
 		return vmf_insert_page_mkwrite(vmf, page, write);
 
 	case PMD_ORDER:
-		if (can_fault(vmf, PMD_SIZE, &pfn))
-			ret = vmf_insert_pfn_pmd(vmf, pfn, write);
-		return ret;
+		if (!can_fault(vmf, PMD_SIZE, &pfn))
+			return VM_FAULT_FALLBACK;
+		if (mshv_vtl_low_span_suborder(pfn, pfn + pmd_pfns))
+			return VM_FAULT_FALLBACK;
+		return vmf_insert_pfn_pmd(vmf, pfn, write);
 
 	case PUD_ORDER:
-		if (can_fault(vmf, PUD_SIZE, &pfn))
-			ret = vmf_insert_pfn_pud(vmf, pfn, write);
-		return ret;
+		return VM_FAULT_FALLBACK;
 
 	default:
 		return VM_FAULT_SIGBUS;
@@ -1545,6 +1593,13 @@ static void __exit mshv_vtl_exit(void)
 		kfree_rcu(range, rcu);
 	}
 	spin_unlock(&mshv_vtl_low_ranges_lock);
+
+	spin_lock(&mshv_vtl_low_suborder_lock);
+	list_for_each_entry_safe(range, tmp, &mshv_vtl_low_suborder_ranges, list) {
+		list_del_rcu(&range->list);
+		kfree_rcu(range, rcu);
+	}
+	spin_unlock(&mshv_vtl_low_suborder_lock);
 }
 
 module_init(mshv_vtl_init);
