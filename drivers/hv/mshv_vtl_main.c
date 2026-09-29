@@ -400,6 +400,24 @@ struct mshv_vtl_low_range {
 	struct rcu_head rcu;
 };
 
+static bool mshv_vtl_low_range_registered(unsigned long start_pfn,
+					  unsigned long end_pfn)
+{
+	struct mshv_vtl_low_range *range;
+	bool found = false;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(range, &mshv_vtl_low_ranges, list) {
+		if (start_pfn >= range->start_pfn && end_pfn <= range->end_pfn) {
+			found = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return found;
+}
+
 static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
 {
 	struct mshv_vtl_ram_disposition vtl0_mem;
@@ -413,6 +431,16 @@ static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
 		dev_err(vtl->module_dev, "range start pfn (%llx) > end pfn (%llx)\n",
 			vtl0_mem.start_pfn, vtl0_mem.last_pfn);
 		return -EFAULT;
+	}
+
+	if (mshv_vtl_low_range_registered(vtl0_mem.start_pfn,
+					  vtl0_mem.last_pfn)) {
+		if (READ_ONCE(mshv_vtl_low_mapping))
+			unmap_mapping_pages(mshv_vtl_low_mapping,
+					    vtl0_mem.start_pfn,
+					    vtl0_mem.last_pfn - vtl0_mem.start_pfn,
+					    true);
+		return 0;
 	}
 
 	pgmap = kzalloc_obj(*pgmap);
@@ -450,6 +478,13 @@ static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
 	addr = devm_memremap_pages(mem_dev, pgmap);
 	if (IS_ERR(addr)) {
 		dev_err(vtl->module_dev, "devm_memremap_pages error: %ld\n", PTR_ERR(addr));
+		if (mshv_vtl_low_range_registered(vtl0_mem.start_pfn,
+						  vtl0_mem.last_pfn)) {
+			kfree(range);
+			kfree(pgmap);
+			return 0;
+		}
+
 		kfree(range);
 		kfree(pgmap);
 		return PTR_ERR(addr);
