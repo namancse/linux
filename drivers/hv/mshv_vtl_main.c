@@ -400,6 +400,10 @@ struct mshv_vtl_low_range {
 	struct rcu_head rcu;
 };
 
+/* Ranges without a vmemmap after devm_memremap_pages() failed. */
+static LIST_HEAD(mshv_vtl_low_failed_ranges);
+static DEFINE_SPINLOCK(mshv_vtl_low_failed_lock);
+
 /* Registered ranges whose pgmap folios are smaller than a PMD. */
 static LIST_HEAD(mshv_vtl_low_suborder_ranges);
 static DEFINE_SPINLOCK(mshv_vtl_low_suborder_lock);
@@ -422,6 +426,24 @@ static bool mshv_vtl_low_range_registered(unsigned long start_pfn,
 	return found;
 }
 
+static bool mshv_vtl_low_span_failed(unsigned long start_pfn,
+				     unsigned long end_pfn)
+{
+	struct mshv_vtl_low_range *range;
+	bool failed = false;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(range, &mshv_vtl_low_failed_ranges, list) {
+		if (start_pfn < range->end_pfn && end_pfn > range->start_pfn) {
+			failed = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return failed;
+}
+
 static bool mshv_vtl_low_span_suborder(unsigned long start_pfn,
 				       unsigned long end_pfn)
 {
@@ -438,6 +460,47 @@ static bool mshv_vtl_low_span_suborder(unsigned long start_pfn,
 	rcu_read_unlock();
 
 	return suborder;
+}
+
+static bool mshv_vtl_low_failed_add(struct mshv_vtl_low_range *range)
+{
+	struct mshv_vtl_low_range *entry, *tmp;
+
+	spin_lock(&mshv_vtl_low_failed_lock);
+	if (mshv_vtl_low_range_registered(range->start_pfn, range->end_pfn)) {
+		spin_unlock(&mshv_vtl_low_failed_lock);
+		return false;
+	}
+
+	list_for_each_entry_safe(entry, tmp, &mshv_vtl_low_failed_ranges, list) {
+		if (entry->end_pfn < range->start_pfn ||
+		    entry->start_pfn > range->end_pfn)
+			continue;
+
+		range->start_pfn = min(range->start_pfn, entry->start_pfn);
+		range->end_pfn = max(range->end_pfn, entry->end_pfn);
+		list_del_rcu(&entry->list);
+		kfree_rcu(entry, rcu);
+	}
+	list_add_rcu(&range->list, &mshv_vtl_low_failed_ranges);
+	spin_unlock(&mshv_vtl_low_failed_lock);
+
+	return true;
+}
+
+static void mshv_vtl_low_failed_clear(unsigned long start_pfn,
+				      unsigned long end_pfn)
+{
+	struct mshv_vtl_low_range *range, *tmp;
+
+	spin_lock(&mshv_vtl_low_failed_lock);
+	list_for_each_entry_safe(range, tmp, &mshv_vtl_low_failed_ranges, list) {
+		if (range->start_pfn >= start_pfn && range->end_pfn <= end_pfn) {
+			list_del_rcu(&range->list);
+			kfree_rcu(range, rcu);
+		}
+	}
+	spin_unlock(&mshv_vtl_low_failed_lock);
 }
 
 static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
@@ -459,6 +522,7 @@ static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
 
 	if (mshv_vtl_low_range_registered(vtl0_mem.start_pfn,
 					  vtl0_mem.last_pfn)) {
+		mshv_vtl_low_failed_clear(vtl0_mem.start_pfn, vtl0_mem.last_pfn);
 		if (READ_ONCE(mshv_vtl_low_mapping))
 			unmap_mapping_pages(mshv_vtl_low_mapping,
 					    vtl0_mem.start_pfn,
@@ -519,7 +583,18 @@ static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
 			return 0;
 		}
 
-		kfree(range);
+		range->start_pfn = vtl0_mem.start_pfn;
+		range->end_pfn = vtl0_mem.last_pfn;
+		if (!mshv_vtl_low_failed_add(range)) {
+			kfree(range);
+			kfree(pgmap);
+			return 0;
+		}
+		if (READ_ONCE(mshv_vtl_low_mapping))
+			unmap_mapping_pages(mshv_vtl_low_mapping,
+					    vtl0_mem.start_pfn,
+					    vtl0_mem.last_pfn - vtl0_mem.start_pfn,
+					    true);
 		kfree(pgmap);
 		return PTR_ERR(addr);
 	}
@@ -544,6 +619,8 @@ static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
 	spin_lock(&mshv_vtl_low_ranges_lock);
 	list_add_rcu(&range->list, &mshv_vtl_low_ranges);
 	spin_unlock(&mshv_vtl_low_ranges_lock);
+
+	mshv_vtl_low_failed_clear(vtl0_mem.start_pfn, vtl0_mem.last_pfn);
 
 	/* Refault pre-registration special PTEs through the pinnable page path. */
 	if (READ_ONCE(mshv_vtl_low_mapping))
@@ -1435,7 +1512,8 @@ static vm_fault_t mshv_vtl_low_huge_fault(struct vm_fault *vmf, unsigned int ord
 	case PMD_ORDER:
 		if (!can_fault(vmf, PMD_SIZE, &pfn))
 			return VM_FAULT_FALLBACK;
-		if (mshv_vtl_low_span_suborder(pfn, pfn + pmd_pfns))
+		if (mshv_vtl_low_span_failed(pfn, pfn + pmd_pfns) ||
+		    mshv_vtl_low_span_suborder(pfn, pfn + pmd_pfns))
 			return VM_FAULT_FALLBACK;
 		return vmf_insert_pfn_pmd(vmf, pfn, write);
 
@@ -1593,6 +1671,13 @@ static void __exit mshv_vtl_exit(void)
 		kfree_rcu(range, rcu);
 	}
 	spin_unlock(&mshv_vtl_low_ranges_lock);
+
+	spin_lock(&mshv_vtl_low_failed_lock);
+	list_for_each_entry_safe(range, tmp, &mshv_vtl_low_failed_ranges, list) {
+		list_del_rcu(&range->list);
+		kfree_rcu(range, rcu);
+	}
+	spin_unlock(&mshv_vtl_low_failed_lock);
 
 	spin_lock(&mshv_vtl_low_suborder_lock);
 	list_for_each_entry_safe(range, tmp, &mshv_vtl_low_suborder_ranges, list) {
