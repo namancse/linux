@@ -18,6 +18,7 @@
 #include <linux/eventfd.h>
 #include <linux/poll.h>
 #include <linux/file.h>
+#include <linux/pagemap.h>
 #include <linux/vmalloc.h>
 #include <asm/debugreg.h>
 #include <asm/mshyperv.h>
@@ -46,6 +47,9 @@ MODULE_DESCRIPTION("Microsoft Hyper-V VTL Driver");
 #define VTL2_VMBUS_SINT_INDEX	7
 
 static struct device *mem_dev;
+
+/* /dev/mshv_vtl_low address_space, used to zap stale 4K PTEs. */
+static struct address_space *mshv_vtl_low_mapping;
 
 static struct tasklet_struct msg_dpc;
 static wait_queue_head_t fd_wait_queue;
@@ -379,9 +383,27 @@ static int vtl_set_vp_register(struct hv_register_assoc *reg)
 					1, input_vtl_normal, reg);
 }
 
+/* Identity token tagged on every mshv_vtl pgmap; only its address matters. */
+static const u8 mshv_vtl_pgmap_token;
+
+/*
+ * Pgmap-backed VTL0 ranges, published only after devm_memremap_pages()
+ * returns and the vmemmap is ready for fault-time page dereferences.
+ */
+static LIST_HEAD(mshv_vtl_low_ranges);
+static DEFINE_SPINLOCK(mshv_vtl_low_ranges_lock);
+
+struct mshv_vtl_low_range {
+	struct list_head list;
+	unsigned long start_pfn;
+	unsigned long end_pfn;
+	struct rcu_head rcu;
+};
+
 static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
 {
 	struct mshv_vtl_ram_disposition vtl0_mem;
+	struct mshv_vtl_low_range *range;
 	struct dev_pagemap *pgmap;
 	void *addr;
 
@@ -405,6 +427,7 @@ static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
 	pgmap->ranges[0].end = PFN_PHYS(vtl0_mem.last_pfn) - 1;
 	pgmap->nr_range = 1;
 	pgmap->type = MEMORY_DEVICE_GENERIC;
+	pgmap->owner = (void *)&mshv_vtl_pgmap_token;
 
 	/*
 	 * Determine the highest page order that can be used for the given memory range.
@@ -418,12 +441,31 @@ static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
 		"Add VTL0 memory: start: 0x%llx, end_pfn: 0x%llx, page order: %lu\n",
 		vtl0_mem.start_pfn, vtl0_mem.last_pfn, pgmap->vmemmap_shift);
 
+	range = kzalloc_obj(*range);
+	if (!range) {
+		kfree(pgmap);
+		return -ENOMEM;
+	}
+
 	addr = devm_memremap_pages(mem_dev, pgmap);
 	if (IS_ERR(addr)) {
 		dev_err(vtl->module_dev, "devm_memremap_pages error: %ld\n", PTR_ERR(addr));
+		kfree(range);
 		kfree(pgmap);
 		return PTR_ERR(addr);
 	}
+
+	/* Publish only after the vmemmap and struct pages are initialized. */
+	range->start_pfn = vtl0_mem.start_pfn;
+	range->end_pfn = vtl0_mem.last_pfn;
+	spin_lock(&mshv_vtl_low_ranges_lock);
+	list_add_rcu(&range->list, &mshv_vtl_low_ranges);
+	spin_unlock(&mshv_vtl_low_ranges_lock);
+
+	/* Refault pre-registration special PTEs through the pinnable page path. */
+	if (READ_ONCE(mshv_vtl_low_mapping))
+		unmap_mapping_pages(mshv_vtl_low_mapping, range->start_pfn,
+				    range->end_pfn - range->start_pfn, true);
 
 	/* Don't free pgmap, since it has to stick around until the memory
 	 * is unmapped, which will never happen as there is no scenario
@@ -1213,6 +1255,14 @@ static struct miscdevice mshv_vtl_hvcall_dev = {
 	.minor = MISC_DYNAMIC_MINOR,
 };
 
+/*
+ * Faulted pgmap folios acquire file rmap state, but do not participate in
+ * writeback.
+ */
+static const struct address_space_operations mshv_vtl_low_aops = {
+	.dirty_folio = noop_dirty_folio,
+};
+
 static int mshv_vtl_low_open(struct inode *inodep, struct file *filp)
 {
 	pid_t pid = task_pid_vnr(current);
@@ -1223,6 +1273,9 @@ static int mshv_vtl_low_open(struct inode *inodep, struct file *filp)
 
 	if (capable(CAP_SYS_ADMIN)) {
 		filp->private_data = inodep;
+		if (!READ_ONCE(mshv_vtl_low_mapping))
+			cmpxchg(&mshv_vtl_low_mapping, NULL, inodep->i_mapping);
+		inodep->i_mapping->a_ops = &mshv_vtl_low_aops;
 	} else {
 		pr_err("%s: VTL low open failed: CAP_SYS_ADMIN required. task group %d, uid %d",
 		       __func__, pid, uid);
@@ -1249,23 +1302,61 @@ static bool can_fault(struct vm_fault *vmf, unsigned long size, unsigned long *p
 	return is_valid;
 }
 
+/* Resolve only ranges whose vmemmap initialization has completed. */
+static struct page *mshv_vtl_low_resolve_page(unsigned long pfn)
+{
+	struct mshv_vtl_low_range *range;
+	struct page *page = NULL;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(range, &mshv_vtl_low_ranges, list) {
+		if (pfn >= range->start_pfn && pfn < range->end_pfn) {
+			struct page *candidate = pfn_to_page(pfn);
+			struct dev_pagemap *pgmap = page_pgmap(candidate);
+
+			if (pgmap && pgmap->owner == &mshv_vtl_pgmap_token)
+				page = candidate;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return page;
+}
+
+static void mshv_vtl_low_set_mapping(struct vm_fault *vmf, struct folio *folio)
+{
+	if (folio->mapping)
+		return;
+
+	folio->mapping = vmf->vma->vm_file->f_mapping;
+	folio->index = linear_page_index(vmf->vma, vmf->address);
+}
+
 static vm_fault_t mshv_vtl_low_huge_fault(struct vm_fault *vmf, unsigned int order)
 {
 	unsigned long pfn = vmf->pgoff;
+	bool write = vmf->flags & FAULT_FLAG_WRITE;
+	struct page *page;
 	vm_fault_t ret = VM_FAULT_FALLBACK;
 
 	switch (order) {
 	case 0:
-		return vmf_insert_mixed(vmf->vma, vmf->address, pfn);
+		page = mshv_vtl_low_resolve_page(pfn);
+		if (!page)
+			return vmf_insert_mixed(vmf->vma, vmf->address, pfn);
+
+		mshv_vtl_low_set_mapping(vmf, page_folio(page));
+		return vmf_insert_page_mkwrite(vmf, page, write);
 
 	case PMD_ORDER:
 		if (can_fault(vmf, PMD_SIZE, &pfn))
-			ret = vmf_insert_pfn_pmd(vmf, pfn, vmf->flags & FAULT_FLAG_WRITE);
+			ret = vmf_insert_pfn_pmd(vmf, pfn, write);
 		return ret;
 
 	case PUD_ORDER:
 		if (can_fault(vmf, PUD_SIZE, &pfn))
-			ret = vmf_insert_pfn_pud(vmf, pfn, vmf->flags & FAULT_FLAG_WRITE);
+			ret = vmf_insert_pfn_pud(vmf, pfn, write);
 		return ret;
 
 	default:
@@ -1285,8 +1376,11 @@ static const struct vm_operations_struct mshv_vtl_low_vm_ops = {
 
 static int mshv_vtl_low_mmap(struct file *filp, struct vm_area_struct *vma)
 {
+	if (!(vma->vm_flags & VM_MAYSHARE))
+		return -EINVAL;
+
 	vma->vm_ops = &mshv_vtl_low_vm_ops;
-	vm_flags_set(vma, VM_HUGEPAGE | VM_MIXEDMAP);
+	vm_flags_set(vma, VM_HUGEPAGE | VM_MIXEDMAP | VM_DONTEXPAND);
 
 	return 0;
 }
@@ -1400,6 +1494,8 @@ free_dev:
 
 static void __exit mshv_vtl_exit(void)
 {
+	struct mshv_vtl_low_range *range, *tmp;
+
 	device_del(mem_dev);
 	kfree(mem_dev);
 	misc_deregister(&mshv_vtl_low);
@@ -1407,6 +1503,13 @@ static void __exit mshv_vtl_exit(void)
 	misc_deregister(&mshv_vtl_sint_dev);
 	hv_vtl_remove_synic();
 	misc_deregister(&mshv_dev);
+
+	spin_lock(&mshv_vtl_low_ranges_lock);
+	list_for_each_entry_safe(range, tmp, &mshv_vtl_low_ranges, list) {
+		list_del_rcu(&range->list);
+		kfree_rcu(range, rcu);
+	}
+	spin_unlock(&mshv_vtl_low_ranges_lock);
 }
 
 module_init(mshv_vtl_init);
