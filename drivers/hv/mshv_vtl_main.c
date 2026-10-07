@@ -395,6 +395,7 @@ static const u8 mshv_vtl_pgmap_token;
 static LIST_HEAD(mshv_vtl_low_ranges);
 static DEFINE_SPINLOCK(mshv_vtl_low_ranges_lock);
 static DEFINE_MUTEX(mshv_vtl_low_registration_lock);
+static DECLARE_RWSEM(mshv_vtl_low_fault_rwsem);
 
 struct mshv_vtl_low_range {
 	struct list_head list;
@@ -506,6 +507,16 @@ static void mshv_vtl_low_failed_clear(unsigned long start_pfn,
 	spin_unlock(&mshv_vtl_low_failed_lock);
 }
 
+static void mshv_vtl_low_synchronize_faults(void)
+{
+	/*
+	 * State is published before this barrier. Drain faults that sampled the
+	 * old state so none can insert a stale mapping after the following zap.
+	 */
+	down_write(&mshv_vtl_low_fault_rwsem);
+	up_write(&mshv_vtl_low_fault_rwsem);
+}
+
 static int mshv_vtl_add_vtl0_mem_locked(struct mshv_vtl *vtl,
 					struct mshv_vtl_ram_disposition vtl0_mem)
 {
@@ -518,6 +529,7 @@ static int mshv_vtl_add_vtl0_mem_locked(struct mshv_vtl *vtl,
 	if (mshv_vtl_low_range_registered(vtl0_mem.start_pfn,
 					  vtl0_mem.last_pfn)) {
 		mshv_vtl_low_failed_clear(vtl0_mem.start_pfn, vtl0_mem.last_pfn);
+		mshv_vtl_low_synchronize_faults();
 		if (READ_ONCE(mshv_vtl_low_mapping))
 			unmap_mapping_pages(mshv_vtl_low_mapping,
 					    vtl0_mem.start_pfn,
@@ -585,6 +597,7 @@ static int mshv_vtl_add_vtl0_mem_locked(struct mshv_vtl *vtl,
 			kfree(pgmap);
 			return 0;
 		}
+		mshv_vtl_low_synchronize_faults();
 		if (READ_ONCE(mshv_vtl_low_mapping))
 			unmap_mapping_pages(mshv_vtl_low_mapping,
 					    vtl0_mem.start_pfn,
@@ -616,6 +629,7 @@ static int mshv_vtl_add_vtl0_mem_locked(struct mshv_vtl *vtl,
 	spin_unlock(&mshv_vtl_low_ranges_lock);
 
 	mshv_vtl_low_failed_clear(vtl0_mem.start_pfn, vtl0_mem.last_pfn);
+	mshv_vtl_low_synchronize_faults();
 
 	/* Refault pre-registration special PTEs through the pinnable page path. */
 	if (READ_ONCE(mshv_vtl_low_mapping))
@@ -1534,7 +1548,7 @@ static void mshv_vtl_low_set_mapping(struct vm_fault *vmf, struct folio *folio)
 	folio->index = linear_page_index(vmf->vma, vmf->address);
 }
 
-static vm_fault_t mshv_vtl_low_huge_fault(struct vm_fault *vmf, unsigned int order)
+static vm_fault_t __mshv_vtl_low_huge_fault(struct vm_fault *vmf, unsigned int order)
 {
 	unsigned long pfn = vmf->pgoff;
 	unsigned long pmd_pfns = PMD_SIZE >> PAGE_SHIFT;
@@ -1564,6 +1578,17 @@ static vm_fault_t mshv_vtl_low_huge_fault(struct vm_fault *vmf, unsigned int ord
 	default:
 		return VM_FAULT_SIGBUS;
 	}
+}
+
+static vm_fault_t mshv_vtl_low_huge_fault(struct vm_fault *vmf, unsigned int order)
+{
+	vm_fault_t ret;
+
+	down_read(&mshv_vtl_low_fault_rwsem);
+	ret = __mshv_vtl_low_huge_fault(vmf, order);
+	up_read(&mshv_vtl_low_fault_rwsem);
+
+	return ret;
 }
 
 static vm_fault_t mshv_vtl_low_fault(struct vm_fault *vmf)
