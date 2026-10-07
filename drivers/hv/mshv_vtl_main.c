@@ -1551,6 +1551,7 @@ static void mshv_vtl_low_set_mapping(struct vm_fault *vmf, struct page *page)
 	folio_lock(folio);
 	if (!folio->mapping) {
 		folio->index = index;
+		/* Publish the head index before making the mapping visible. */
 		smp_wmb();
 		folio->mapping = mapping;
 	} else {
