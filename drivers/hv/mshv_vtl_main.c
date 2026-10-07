@@ -49,6 +49,8 @@ MODULE_DESCRIPTION("Microsoft Hyper-V VTL Driver");
 static struct device *mem_dev;
 
 /* /dev/mshv_vtl_low address_space, used to zap stale 4K PTEs. */
+static DEFINE_MUTEX(mshv_vtl_low_mapping_lock);
+static struct inode *mshv_vtl_low_inode;
 static struct address_space *mshv_vtl_low_mapping;
 
 static struct tasklet_struct msg_dpc;
@@ -1423,6 +1425,20 @@ static const struct address_space_operations mshv_vtl_low_aops = {
 	.dirty_folio = noop_dirty_folio,
 };
 
+static void mshv_vtl_low_mapping_cleanup(void)
+{
+	struct inode *inode;
+
+	mutex_lock(&mshv_vtl_low_mapping_lock);
+	inode = mshv_vtl_low_inode;
+	mshv_vtl_low_inode = NULL;
+	WRITE_ONCE(mshv_vtl_low_mapping, NULL);
+	mutex_unlock(&mshv_vtl_low_mapping_lock);
+
+	if (inode)
+		iput(inode);
+}
+
 static int mshv_vtl_low_open(struct inode *inodep, struct file *filp)
 {
 	pid_t pid = task_pid_vnr(current);
@@ -1432,10 +1448,22 @@ static int mshv_vtl_low_open(struct inode *inodep, struct file *filp)
 	pr_debug("%s: Opening VTL low, task group %d, uid %d\n", __func__, pid, uid);
 
 	if (capable(CAP_SYS_ADMIN)) {
-		filp->private_data = inodep;
-		if (!READ_ONCE(mshv_vtl_low_mapping))
-			cmpxchg(&mshv_vtl_low_mapping, NULL, inodep->i_mapping);
-		inodep->i_mapping->a_ops = &mshv_vtl_low_aops;
+		mutex_lock(&mshv_vtl_low_mapping_lock);
+		if (!mshv_vtl_low_inode) {
+			mshv_vtl_low_inode = igrab(inodep);
+			if (!mshv_vtl_low_inode) {
+				ret = -ENOENT;
+			} else {
+				inodep->i_mapping->a_ops = &mshv_vtl_low_aops;
+				WRITE_ONCE(mshv_vtl_low_mapping, inodep->i_mapping);
+			}
+		} else if (mshv_vtl_low_inode != inodep) {
+			ret = -EBUSY;
+		}
+		mutex_unlock(&mshv_vtl_low_mapping_lock);
+
+		if (!ret)
+			filp->private_data = inodep;
 	} else {
 		pr_err("%s: VTL low open failed: CAP_SYS_ADMIN required. task group %d, uid %d",
 		       __func__, pid, uid);
@@ -1641,6 +1669,7 @@ free_mem:
 	kfree(mem_dev);
 free_low:
 	misc_deregister(&mshv_vtl_low);
+	mshv_vtl_low_mapping_cleanup();
 free_hvcall:
 	misc_deregister(&mshv_vtl_hvcall_dev);
 free_sint:
@@ -1660,6 +1689,7 @@ static void __exit mshv_vtl_exit(void)
 	device_del(mem_dev);
 	kfree(mem_dev);
 	misc_deregister(&mshv_vtl_low);
+	mshv_vtl_low_mapping_cleanup();
 	misc_deregister(&mshv_vtl_hvcall_dev);
 	misc_deregister(&mshv_vtl_sint_dev);
 	hv_vtl_remove_synic();
