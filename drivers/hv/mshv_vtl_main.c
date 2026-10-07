@@ -394,6 +394,7 @@ static const u8 mshv_vtl_pgmap_token;
  */
 static LIST_HEAD(mshv_vtl_low_ranges);
 static DEFINE_SPINLOCK(mshv_vtl_low_ranges_lock);
+static DEFINE_MUTEX(mshv_vtl_low_registration_lock);
 
 struct mshv_vtl_low_range {
 	struct list_head list;
@@ -505,22 +506,14 @@ static void mshv_vtl_low_failed_clear(unsigned long start_pfn,
 	spin_unlock(&mshv_vtl_low_failed_lock);
 }
 
-static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
+static int mshv_vtl_add_vtl0_mem_locked(struct mshv_vtl *vtl,
+					struct mshv_vtl_ram_disposition vtl0_mem)
 {
-	struct mshv_vtl_ram_disposition vtl0_mem;
 	struct mshv_vtl_low_range *range;
 	struct mshv_vtl_low_range *suborder = NULL;
 	struct dev_pagemap *pgmap;
 	unsigned long pfn;
 	void *addr;
-
-	if (copy_from_user(&vtl0_mem, arg, sizeof(vtl0_mem)))
-		return -EFAULT;
-	if (vtl0_mem.last_pfn <= vtl0_mem.start_pfn) {
-		dev_err(vtl->module_dev, "range start pfn (%llx) > end pfn (%llx)\n",
-			vtl0_mem.start_pfn, vtl0_mem.last_pfn);
-		return -EFAULT;
-	}
 
 	if (mshv_vtl_low_range_registered(vtl0_mem.start_pfn,
 					  vtl0_mem.last_pfn)) {
@@ -634,6 +627,26 @@ static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
 	 * where VTL0 can be released/shutdown without bringing down VTL2.
 	 */
 	return 0;
+}
+
+static int mshv_vtl_ioctl_add_vtl0_mem(struct mshv_vtl *vtl, void __user *arg)
+{
+	struct mshv_vtl_ram_disposition vtl0_mem;
+	int ret;
+
+	if (copy_from_user(&vtl0_mem, arg, sizeof(vtl0_mem)))
+		return -EFAULT;
+	if (vtl0_mem.last_pfn <= vtl0_mem.start_pfn) {
+		dev_err(vtl->module_dev, "range start pfn (%llx) > end pfn (%llx)\n",
+			vtl0_mem.start_pfn, vtl0_mem.last_pfn);
+		return -EFAULT;
+	}
+
+	mutex_lock(&mshv_vtl_low_registration_lock);
+	ret = mshv_vtl_add_vtl0_mem_locked(vtl, vtl0_mem);
+	mutex_unlock(&mshv_vtl_low_registration_lock);
+
+	return ret;
 }
 
 static void mshv_vtl_cancel(int cpu)
