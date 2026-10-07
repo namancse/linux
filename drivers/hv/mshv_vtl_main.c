@@ -438,7 +438,10 @@ static bool mshv_vtl_low_span_failed(unsigned long start_pfn,
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(range, &mshv_vtl_low_failed_ranges, list) {
-		if (start_pfn < range->end_pfn && end_pfn > range->start_pfn) {
+		unsigned long range_start = READ_ONCE(range->start_pfn);
+		unsigned long range_end = READ_ONCE(range->end_pfn);
+
+		if (start_pfn < range_end && end_pfn > range_start) {
 			failed = true;
 			break;
 		}
@@ -477,8 +480,8 @@ static bool mshv_vtl_low_failed_add(struct mshv_vtl_low_range *range)
 	}
 
 	list_for_each_entry_safe(entry, tmp, &mshv_vtl_low_failed_ranges, list) {
-		if (entry->end_pfn < range->start_pfn ||
-		    entry->start_pfn > range->end_pfn)
+		if (entry->end_pfn <= range->start_pfn ||
+		    entry->start_pfn >= range->end_pfn)
 			continue;
 
 		range->start_pfn = min(range->start_pfn, entry->start_pfn);
@@ -495,16 +498,40 @@ static bool mshv_vtl_low_failed_add(struct mshv_vtl_low_range *range)
 static void mshv_vtl_low_failed_clear(unsigned long start_pfn,
 				      unsigned long end_pfn)
 {
-	struct mshv_vtl_low_range *range, *tmp;
+	struct mshv_vtl_low_range *range, *split, *tmp;
+
+	split = kzalloc_obj(*split);
 
 	spin_lock(&mshv_vtl_low_failed_lock);
 	list_for_each_entry_safe(range, tmp, &mshv_vtl_low_failed_ranges, list) {
-		if (range->start_pfn >= start_pfn && range->end_pfn <= end_pfn) {
+		unsigned long range_start = range->start_pfn;
+		unsigned long range_end = range->end_pfn;
+
+		if (range_end <= start_pfn || range_start >= end_pfn)
+			continue;
+
+		if (range_start >= start_pfn && range_end <= end_pfn) {
 			list_del_rcu(&range->list);
 			kfree_rcu(range, rcu);
+		} else if (range_start < start_pfn && range_end > end_pfn) {
+			/* Keep the conservative marker if it cannot be split. */
+			if (!split)
+				continue;
+
+			split->start_pfn = end_pfn;
+			split->end_pfn = range_end;
+			list_add_rcu(&split->list, &range->list);
+			WRITE_ONCE(range->end_pfn, start_pfn);
+			split = NULL;
+		} else if (range_start < start_pfn) {
+			WRITE_ONCE(range->end_pfn, start_pfn);
+		} else {
+			WRITE_ONCE(range->start_pfn, end_pfn);
 		}
 	}
 	spin_unlock(&mshv_vtl_low_failed_lock);
+
+	kfree(split);
 }
 
 static void mshv_vtl_low_synchronize_faults(void)
