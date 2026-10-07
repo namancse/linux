@@ -86,7 +86,7 @@ config MSHV_ROOT
 	  If unsure, say N.
 
 config MSHV_VTL
-	tristate "Microsoft Hyper-V VTL driver"
+	bool "Microsoft Hyper-V VTL driver"
 	depends on X86_64 && HYPERV_VTL_MODE
 	depends on HYPERV_VMBUS
 	# Mapping VTL0 memory to a userspace process in VTL2 is supported in OpenHCL.
@@ -106,6 +106,9 @@ config MSHV_VTL
 	  allow userspace to make direct hypercalls. This also allows to map VTL0's address
 	  space to a usermode process in VTL2 and supports getting new VMBus messages and channel
 	  events in VTL2.
+
+	  The VTL0 pgmaps and their pinned folios live for the lifetime of the
+	  VTL2 kernel, so this driver cannot be built as a module.
 
 	  If unsure, say N.
 

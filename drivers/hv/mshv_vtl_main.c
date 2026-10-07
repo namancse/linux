@@ -1682,40 +1682,4 @@ free_dev:
 	return ret;
 }
 
-static void __exit mshv_vtl_exit(void)
-{
-	struct mshv_vtl_low_range *range, *tmp;
-
-	device_del(mem_dev);
-	kfree(mem_dev);
-	misc_deregister(&mshv_vtl_low);
-	mshv_vtl_low_mapping_cleanup();
-	misc_deregister(&mshv_vtl_hvcall_dev);
-	misc_deregister(&mshv_vtl_sint_dev);
-	hv_vtl_remove_synic();
-	misc_deregister(&mshv_dev);
-
-	spin_lock(&mshv_vtl_low_ranges_lock);
-	list_for_each_entry_safe(range, tmp, &mshv_vtl_low_ranges, list) {
-		list_del_rcu(&range->list);
-		kfree_rcu(range, rcu);
-	}
-	spin_unlock(&mshv_vtl_low_ranges_lock);
-
-	spin_lock(&mshv_vtl_low_failed_lock);
-	list_for_each_entry_safe(range, tmp, &mshv_vtl_low_failed_ranges, list) {
-		list_del_rcu(&range->list);
-		kfree_rcu(range, rcu);
-	}
-	spin_unlock(&mshv_vtl_low_failed_lock);
-
-	spin_lock(&mshv_vtl_low_suborder_lock);
-	list_for_each_entry_safe(range, tmp, &mshv_vtl_low_suborder_ranges, list) {
-		list_del_rcu(&range->list);
-		kfree_rcu(range, rcu);
-	}
-	spin_unlock(&mshv_vtl_low_suborder_lock);
-}
-
 module_init(mshv_vtl_init);
-module_exit(mshv_vtl_exit);
