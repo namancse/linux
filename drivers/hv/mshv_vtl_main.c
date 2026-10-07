@@ -1539,13 +1539,25 @@ static struct page *mshv_vtl_low_resolve_page(unsigned long pfn)
 	return page;
 }
 
-static void mshv_vtl_low_set_mapping(struct vm_fault *vmf, struct folio *folio)
+static void mshv_vtl_low_set_mapping(struct vm_fault *vmf, struct page *page)
 {
-	if (folio->mapping)
-		return;
+	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
+	struct folio *folio = page_folio(page);
+	pgoff_t index;
 
-	folio->mapping = vmf->vma->vm_file->f_mapping;
-	folio->index = linear_page_index(vmf->vma, vmf->address);
+	index = linear_page_index(vmf->vma, vmf->address) -
+		folio_page_idx(folio, page);
+
+	folio_lock(folio);
+	if (!folio->mapping) {
+		folio->index = index;
+		smp_wmb();
+		folio->mapping = mapping;
+	} else {
+		WARN_ON_ONCE(folio_mapping(folio) != mapping ||
+			     folio->index != index);
+	}
+	folio_unlock(folio);
 }
 
 static vm_fault_t __mshv_vtl_low_huge_fault(struct vm_fault *vmf, unsigned int order)
@@ -1561,7 +1573,7 @@ static vm_fault_t __mshv_vtl_low_huge_fault(struct vm_fault *vmf, unsigned int o
 		if (!page)
 			return vmf_insert_mixed(vmf->vma, vmf->address, pfn);
 
-		mshv_vtl_low_set_mapping(vmf, page_folio(page));
+		mshv_vtl_low_set_mapping(vmf, page);
 		return vmf_insert_page_mkwrite(vmf, page, write);
 
 	case PMD_ORDER:
